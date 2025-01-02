@@ -26,11 +26,8 @@ import torch
 from .utils import split_tensor_along_last_dim
 
 
-def _reduce(ctx: Any, input_: torch.Tensor) -> torch.Tensor:
+def _reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the the input tensor across model parallel group."""
-    if ctx:
-        ctx.mark_dirty(input_)
-
     # Bypass the function if we are using only 1 GPU.
     if torch.distributed.get_world_size() == 1:
         return input_
@@ -97,7 +94,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_):  # type: ignore
-        return _reduce(ctx, input_)
+        return _reduce(input_)
 
     @staticmethod
     def backward(ctx, grad_output):  # type: ignore
@@ -134,16 +131,28 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 
 
 def copy_to_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return input_
+    # it's only needed for backpropagation, so we can skip it
+    # it introduces a lot of overhead
     return _CopyToModelParallelRegion.apply(input_)
 
 
 def reduce_from_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _reduce(input_)
+    # it's only needed for backpropagation, so we can skip it
+    # it introduces a lot of overhead
     return _ReduceFromModelParallelRegion.apply(input_)
 
 
 def scatter_to_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _split(input_)
+    # it's only needed for backpropagation, so we can skip it
+    # it introduces a lot of overhead
     return _ScatterToModelParallelRegion.apply(input_)
 
 
 def gather_from_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _gather(input_)
+    # it's only needed for backpropagation, so we can skip it
+    # it introduces a lot of overhead
     return _GatherFromModelParallelRegion.apply(input_)
