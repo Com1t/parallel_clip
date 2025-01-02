@@ -13,11 +13,11 @@ def main():
     rank = int(os.environ["LOCAL_RANK"])
 
     if not dist.is_initialized():
-        dist.init_process_group("gloo")
+        dist.init_process_group("nccl")
 
-    device = torch.device("cpu")
+    device = torch.device(f"cuda:{rank}")
     torch.set_default_device(device)
-    torch.set_default_dtype(torch.float32)
+    torch.set_default_dtype(torch.float16)
 
     # Configuration
     cfg = CLIPVisionConfig()
@@ -31,7 +31,7 @@ def main():
     cfg.projection_dim = 768
 
     # Example input and configuration
-    batch_size = 40
+    batch_size = 256
     seq_len = 577
 
     input_tensor = torch.zeros([batch_size, seq_len, cfg.hidden_size])
@@ -50,39 +50,55 @@ def main():
     )
 
     # warmup
-    with torch.no_grad():
-        local_output, _ = local_attn(input_tensor)
-        parallel_output, _ = parallel_attn(input_tensor)
+    num_warmup_runs = 10
+    for _ in range(num_warmup_runs):
+        with torch.no_grad():
+            _ = parallel_attn(input_tensor)
+            _ = local_attn(input_tensor)
+    dist.barrier()
 
     # Forward pass on GPU
-    with torch.no_grad():
-        if rank == 0:
+    num_runs = 20
+    parallel_time = 0.0
+    for _ in range(num_runs):
+        dist.barrier()
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            start_time = time.time()
+            parallel_output, _ = parallel_attn(input_tensor)
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            parallel_time += end_time - start_time
+    parallel_time /= num_runs
+    print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
+
+    # Reduce the maximum parallel time to rank 0
+    parallel_time_tensor = torch.tensor(parallel_time, device=device)
+    dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_parallel_time = parallel_time_tensor.item()
+        print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
+
+    local_time = 0.0
+    for _ in range(num_runs):
+        with torch.no_grad():
             torch.cuda.synchronize()
             start_time = time.time()
             local_output, _ = local_attn(input_tensor)
             torch.cuda.synchronize()
             end_time = time.time()
 
-            local_time = end_time - start_time
-            print(f"time for local attention: {local_time * 1000:.3} ms")
+            local_time += end_time - start_time
+    local_time /= num_runs
+    print(f"Rank {rank}: time for local attention: {local_time * 1000:.3} ms")
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        start_time = time.time()
-        parallel_output, _ = parallel_attn(input_tensor)
-        dist.barrier()
-        torch.cuda.synchronize()
-        end_time = time.time()
-
-        parallel_time = end_time - start_time
-        print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
-
-        # Reduce the maximum parallel time to rank 0
-        parallel_time_tensor = torch.tensor(parallel_time, device=device)
-        dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            max_parallel_time = parallel_time_tensor.item()
-            print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
+    # Reduce the maximum parallel time to rank 0
+    local_time_tensor = torch.tensor(local_time, device=device)
+    dist.reduce(local_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_local_time = local_time_tensor.item()
+        print(f"Max local attention time: {max_local_time * 1000:.3} ms")
 
     # Verification: Check if the outputs are close
     if rank == 0:

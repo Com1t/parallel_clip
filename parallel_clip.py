@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 from PIL import Image
 import requests
-from transformers import AutoProcessor, CLIPVisionConfig
+from transformers import CLIPVisionConfig
 from modeling_clip import CLIPVisionModel
 from modeling_parallel_clip import ParallelCLIPVisionModel
 
@@ -19,11 +19,11 @@ def main():
     rank = int(os.environ["LOCAL_RANK"])
 
     if not dist.is_initialized():
-        dist.init_process_group("gloo")
+        dist.init_process_group("nccl")
 
-    device = torch.device("cpu")
+    device = torch.device(f"cuda:{rank}")
     torch.set_default_device(device)
-    torch.set_default_dtype(torch.float32)
+    torch.set_default_dtype(torch.float16)
 
     # Configuration
     cfg = CLIPVisionConfig()
@@ -36,12 +36,12 @@ def main():
     cfg.patch_size = 14
     cfg.projection_dim = 768
 
-    local_model = CLIPVisionModel(cfg)
+    local_model = CLIPVisionModel(cfg).to(device)
     local_model.vision_model.embeddings.weight_init()
     for layer in local_model.vision_model.encoder.layers:
         layer.self_attn.weight_init()
         layer.mlp.weight_init()
-    parallel_model = ParallelCLIPVisionModel(cfg)
+    parallel_model = ParallelCLIPVisionModel(cfg).to(device)
     parallel_model.vision_model.embeddings.class_embedding = (
         local_model.vision_model.embeddings.class_embedding
     )
@@ -65,45 +65,64 @@ def main():
         )
         target_layer.mlp.weight_init(raw_layer.mlp.fc1, raw_layer.mlp.fc2)
 
-    processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
-
-    url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-    image = Image.open(requests.get(url, stream=True).raw)
-
-    inputs = processor(images=image, return_tensors="pt")
+    batch_size = 1
+    inputs = torch.rand(batch_size, 3, 336, 336).to(device)
 
     # warmup
-    with torch.no_grad():
-        local_output = local_model(**inputs)
-        parallel_output = parallel_model(**inputs)
+    num_warmup_runs = 10
+    for _ in range(num_warmup_runs):
+        with torch.no_grad():
+            _ = local_model(inputs)
+            _ = parallel_model(inputs)
+    dist.barrier()
+
+    print("warmed!")
 
     # Forward pass on GPU
-    with torch.no_grad():
-        if rank == 0:
+    num_runs = 20
+    parallel_time = 0.0
+    for _ in range(num_runs):
+        dist.barrier()
+        with torch.no_grad():
             torch.cuda.synchronize()
             start_time = time.time()
-            local_output = local_model(**inputs)
+            parallel_output = parallel_model(inputs)
+            # dist.barrier()
             torch.cuda.synchronize()
             end_time = time.time()
 
-            local_time = end_time - start_time
-            print(f"time for local MLP: {local_time * 1000:.3} ms")
+            parallel_time += end_time - start_time
+            # if rank == 0:
+            #     print(f"Rank {rank}: time for CLIP: {(end_time - start_time) * 1000:.3} ms")
+    parallel_time /= num_runs
+    print(f"Rank {rank}: time for CLIP: {parallel_time * 1000:.3} ms")
 
-        torch.cuda.synchronize()
-        start_time = time.time()
-        parallel_output = parallel_model(**inputs)
-        torch.cuda.synchronize()
-        end_time = time.time()
+    # Reduce the maximum parallel time to rank 0
+    parallel_time_tensor = torch.tensor(parallel_time, device=device)
+    dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_parallel_time = parallel_time_tensor.item()
+        print(f"Max parallel CLIP time: {max_parallel_time * 1000:.3} ms")
 
-        # Reduce the maximum parallel time
-        parallel_time = end_time - start_time
-        print(f"Rank {rank}: time for parallel attention: {parallel_time * 1000:.3} ms")
+    local_time = 0.0
+    for _ in range(num_runs):
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            start_time = time.time()
+            local_output = local_model(inputs)
+            torch.cuda.synchronize()
+            end_time = time.time()
 
-        parallel_time_tensor = torch.tensor(parallel_time, device=device)
-        dist.reduce(parallel_time_tensor, dst=0, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            max_parallel_time = parallel_time_tensor.item()
-            print(f"Max parallel attention time: {max_parallel_time * 1000:.3} ms")
+            local_time += end_time - start_time
+    local_time /= num_runs
+    print(f"Rank {rank}: time for local CLIP: {local_time * 1000:.3} ms")
+
+    # Reduce the maximum parallel time to rank 0
+    local_time_tensor = torch.tensor(local_time, device=device)
+    dist.reduce(local_time_tensor, dst=0, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        max_local_time = local_time_tensor.item()
+        print(f"Max local CLIP time: {max_local_time * 1000:.3} ms")
 
     # Verification: Check if the outputs are close
     if rank == 0:
